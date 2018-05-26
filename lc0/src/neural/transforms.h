@@ -60,7 +60,6 @@ namespace lczero {
                             std::vector<float>& M,
                             std::vector<float>& output);
     
-    template<unsigned int filter_size>
     static void convolve(size_t outputs,
                   const std::vector<float>& input,
                   const std::vector<float>& weights,
@@ -73,15 +72,11 @@ namespace lczero {
                       const std::vector<float>& biases,
                       std::vector<float>& output);
     
-    template <size_t spatial_size>
     static void batchnorm(size_t channels,
                    std::vector<float>& data,
                    const float* means,
                    const float* stddivs,
                    const float* eltwise = nullptr);
-    
-    template <unsigned long filter_size>
-    static void im2col(const int channels, const std::vector<float>& input, std::vector<float>& output);
     
     static void softmax(const std::vector<float>& input,
                         std::vector<float>& output);
