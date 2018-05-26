@@ -57,23 +57,13 @@ namespace lczero {
       }
 
             
-     // Do the computation.
-      void ComputeBlocking() override {
-        
-        for (auto& sample : planes_) {
-          auto value; auto policy;
-          std::tie(value, policy) = network.ComputeBlocking(sample);
-          q_value_.emplace_back(value);
-          policy_data_.emplace_back(policy);
-        }
-
-      }
-      
       // Returns how many times AddInput() was called.
       int GetBatchSize() const override {
          return planes_.size();
       }
       
+      void ComputeBlocking();
+
       // Returns Q value of @sample.
       float GetQVal(int sample) const override {
         return q_value_[sample];
@@ -104,15 +94,12 @@ namespace lczero {
       BlasNetwork(const Weights& weights, const OptionsDict& /* options */):
       weights_(weights)
       {
-        constexpr float EPSILON=1e-5;
-
         const size_t channels = weights.input.biases.size();
-        const size_t residual_blocks = weights.residual.size();
         
         // input block
         weights_.input.weights = Transforms::winograd_transform_f(weights_.input.weights, channels, kInputPlanes);
-        OffsetBatchNormMeans(weights_.input.bn_means, weights_.input.biases);
-        InvertBatchNormStddev(weights_.input.bn_stddivs);
+        Transforms::OffsetBatchNormMeans(weights_.input.bn_means, weights_.input.biases);
+        Transforms::InvertBatchNormStddev(weights_.input.bn_stddivs);
         
         // residual blocks
         for (auto& resblock : weights_.residual) {
@@ -122,18 +109,18 @@ namespace lczero {
           conv1.weights = Transforms::winograd_transform_f(conv1.weights, channels, channels);
           conv2.weights = Transforms::winograd_transform_f(conv2.weights, channels, channels);
           
-          OffsetBatchNormMeans(conv1.bn_means, conv1.biases);
-          OffsetBatchNormMeans(conv2.bn_means, conv2.biases);
+          Transforms::OffsetBatchNormMeans(conv1.bn_means, conv1.biases);
+          Transforms::OffsetBatchNormMeans(conv2.bn_means, conv2.biases);
 
-          InvertBatchNormStddev(conv1.bn_stddivs);
-          InvertBatchNormStddev(conv2.bn_stddivs);
+          Transforms::InvertBatchNormStddev(conv1.bn_stddivs);
+          Transforms::InvertBatchNormStddev(conv2.bn_stddivs);
         }
         
-        OffsetBatchNormMeans(weights_.policy.bn_means, weights_.policy.biases);
-        InvertBatchNormStddev(weights_.policy.bn_stddivs);
+        Transforms::OffsetBatchNormMeans(weights_.policy.bn_means, weights_.policy.biases);
+        Transforms::InvertBatchNormStddev(weights_.policy.bn_stddivs);
         
-        OffsetBatchNormMeans(weights_.value.bn_means, weights_.value.biases);
-        InvertBatchNormStddev(weights_.value.bn_stddivs);
+        Transforms::OffsetBatchNormMeans(weights_.value.bn_means, weights_.value.biases);
+        Transforms::InvertBatchNormStddev(weights_.value.bn_stddivs);
 
 #ifdef USE_OPENBLAS
         //openblas_set_num_threads(1);
@@ -150,9 +137,9 @@ namespace lczero {
 
       }
 
-      void BlasNetwork::forward(const std::vector<float>& input,
-                                std::vector<float>& output_pol,
-                                std::vector<float>& output_val) {
+      void forward(const std::vector<float>& input,
+                   std::vector<float>& output_pol,
+                   std::vector<float>& output_val) const {
         
         // Input convolution
         constexpr int width = 8;
@@ -201,10 +188,10 @@ namespace lczero {
           std::swap(conv_out, conv_in);
           Transforms::winograd_convolve3(output_channels, conv_in,
                                          conv2.weights, V, M, conv_out);
-          Transforms::batchnorm<64>(output_channels, conv_out,
-                                    conv2.bn_means,
-                                    conv2.bn_stddivs,
-                                    res.data());
+          Transforms::batchnorm(output_channels, conv_out,
+                                conv2.bn_means,
+                                conv2.bn_stddivs,
+                                res.data());
         }
 
         Transforms::convolve(weights_.policy.bn_means.size(), conv_out, // NUM_POLICY_INPUT_PLANES
@@ -220,14 +207,14 @@ namespace lczero {
         Transforms::innerproduct(value_data, weights_.ip1_val_w, weights_.ip1_val_b, output_val, true); // value head gets relu applied
       }
 
-      std::pair<float, std::vector<float>> BlasNetwork::ComputeBlocking(const InputPlanes &sample) const {
+      std::pair<float, std::vector<float>> ComputeBlocking(const InputPlanes &sample) const {
         std::vector<float> input_data(kInputPlanes*64);
         int index=0;
         for (const InputPlane& plane : sample) {
           float value=plane.value;
           const uint64_t one=1;
           for (int i=0; i<64; i++)
-            input_data_[index++]=((plane.mask&(one<<i))==0 ) ? 0 : value;
+            input_data[index++]=((plane.mask&(one<<i))==0 ) ? 0 : value;
         }
 
         std::vector<float> policy_data(weights_.ip_pol_b.size());
@@ -239,12 +226,12 @@ namespace lczero {
         Transforms::softmax(policy_data, policy_data);
         
         // Now get the score
-        double winrate = Transforms::innerproduct(ip2_val_w_, value_data)+weights_.ip2_val_b_[0];
-        return std::pair<float, std::vector<float>>(value, policy);
+        double value = Transforms::innerproduct(weights_.ip2_val_w, value_data) + weights_.ip2_val_b[0];
+        return std::pair<float, std::vector<float>>(value, policy_data);
       }
     
       std::unique_ptr<NetworkComputation> NewComputation() override {
-        return std::make_unique<BlasComputation>(weights_);
+        return std::make_unique<BlasComputation>(*this);
       }
       
       
@@ -253,10 +240,19 @@ namespace lczero {
       
     };
       
-    
-    
-  } // namespace
-  
+    // Do the computation.
+    void BlasComputation::ComputeBlocking() {
+        
+      for (auto& sample : planes_) {
+        float value; std::vector<float> policy;
+        std::tie(value, policy) = network_.ComputeBlocking(sample);
+        q_value_.emplace_back(value);
+        policy_data_.emplace_back(policy);
+      }
+
+    }
+
+
   REGISTER_NETWORK("blas", BlasNetwork, 50)
   
   

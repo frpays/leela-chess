@@ -66,14 +66,7 @@ namespace lczero {
     public:
       
      // Do the computation.
-      void ComputeBlocking() override {
-        for (auto& sample : planes_) {
-          auto value; auto policy;
-          std::tie(value, policy) = opencl_net_.ComputeBlocking(sample);
-          q_value_.emplace_back(value);
-          policy_data_.emplace_back(policy);
-        }
-      }
+      void ComputeBlocking();
 
       // Returns how many times AddInput() was called.
       int GetBatchSize() const override {
@@ -109,11 +102,11 @@ namespace lczero {
       OpenCLNetwork(const Weights& w, const OptionsDict& options):
       params_(),
       opencl_(),
-      opencl_net_(opencl_)
+      opencl_net_(opencl_),
       ip2_val_w_(w.ip2_val_w),
       ip2_val_b_(w.ip2_val_b),
-      policy_data_size_(weights.ip_pol_b.size()),
-      value_data_size_(weights.ip1_val_b.size())
+      policy_data_size_(w.ip_pol_b.size()),
+      value_data_size_(w.ip1_val_b.size())
       {
         Weights weights = w; // temporary local copy, to be released when ctor complete
 
@@ -122,11 +115,8 @@ namespace lczero {
         params_.force_tune=options.GetOrDefault<int>("force_tune", false);
         params_.tune_only=options.GetOrDefault<int>("tune_only", false);
         params_.tune_exhaustive=options.GetOrDefault<int>("tune_exhaustive", false);
-        
 
         const size_t channels = weights.input.biases.size();
-        const size_t residual_blocks = weights.residual.size();
-        
         
         opencl_.initialize(channels, params_);
         
@@ -141,12 +131,12 @@ namespace lczero {
         size_t k_ceil = ceilMultiple(ceilMultiple(kInputPlanes, kwg), vwm);
         
         // first, process the input block
-        weights.input.weights = Transforms::winograd_transform_f(weights.input.weights, channels, inputChannels);
+        weights.input.weights = Transforms::winograd_transform_f(weights.input.weights, channels, kInputPlanes);
         auto Upad = Transforms::zeropad_U(weights.input.weights,
                                           channels, kInputPlanes,
                                           m_ceil, k_ceil);
-        OffsetBatchNormMeans(input_batchnorm_means, weights.input.biases);
-        InvertBatchNormStddev(weights.input.bn_stddivs);
+        Transforms::OffsetBatchNormMeans(weights.input.bn_means, weights.input.biases);
+        Transforms::InvertBatchNormStddev(weights.input.bn_stddivs);
         
         // Winograd filter transformation changes filter size to 4x4
         opencl_net_.push_input_convolution(WINOGRAD_ALPHA, kInputPlanes, channels,
@@ -168,11 +158,11 @@ namespace lczero {
                                              channels, channels,
                                              m_ceil, m_ceil);
           
-          OffsetBatchNormMeans(conv1.bn_means, conv1.biases);
-          OffsetBatchNormMeans(conv2.bn_means, conv2.biases);
+          Transforms::OffsetBatchNormMeans(conv1.bn_means, conv1.biases);
+          Transforms::OffsetBatchNormMeans(conv2.bn_means, conv2.biases);
 
-          InvertBatchNormStddev(conv1.bn_stddivs);
-          InvertBatchNormStddev(conv2.bn_stddivs);
+          Transforms::InvertBatchNormStddev(conv1.bn_stddivs);
+          Transforms::InvertBatchNormStddev(conv2.bn_stddivs);
           
           opencl_net_.push_residual(WINOGRAD_ALPHA, channels, channels,
                                     Upad1, conv1.bn_means, conv1.bn_stddivs,
@@ -184,12 +174,12 @@ namespace lczero {
         
         // policy head
         const auto num_p_inputs  = weights.policy.bn_means.size(); // NUM_POLICY_INPUT_PLANES
-        OffsetBatchNormMeans(weights.policy.bn_means, weights.policy.biases);
-        InvertBatchNormStddev(weights.policy.bn_stddivs);
+        Transforms::OffsetBatchNormMeans(weights.policy.bn_means, weights.policy.biases);
+        Transforms::InvertBatchNormStddev(weights.policy.bn_stddivs);
 
         opencl_net_.push_policy(channels, num_p_inputs,
                                 num_p_inputs*width*height,
-                                weights.ip1_pol_b.size(),
+                                weights.ip_pol_b.size(),
                                 weights.policy.weights,
                                 weights.policy.bn_means,
                                 weights.policy.bn_stddivs,
@@ -198,8 +188,8 @@ namespace lczero {
 
         // value head
         const auto num_v_inputs  = weights.value.bn_means.size();  // NUM_VALUE_INPUT_PLANES
-        OffsetBatchNormMeans(weights.value.bn_means, weights.value.biases);
-        InvertBatchNormStddev(weights.value.bn_stddivs);
+        Transforms::OffsetBatchNormMeans(weights.value.bn_means, weights.value.biases);
+        Transforms::InvertBatchNormStddev(weights.value.bn_stddivs);
 
         opencl_net_.push_value(channels, num_v_inputs,
                                num_v_inputs*width*height,
@@ -211,10 +201,10 @@ namespace lczero {
       }
       
       std::unique_ptr<NetworkComputation> NewComputation() override {
-        return std::make_unique<OpenCLComputation>(opencl_net_);
+        return std::make_unique<OpenCLComputation>(*this);
       }
       
-      std::pair<float, std::vector<float>> OpenCLNetwork::ComputeBlocking(const InputPlanes &sample) const {
+      std::pair<float, std::vector<float>> ComputeBlocking(const InputPlanes &sample) const {
         std::vector<float> input_data(kInputPlanes*64);
         int index=0;
         for (const InputPlane& plane : sample) {
@@ -233,8 +223,8 @@ namespace lczero {
         Transforms::softmax(policy_data, policy_data);
         
         // Now get the score
-        double winrate = Transforms::innerproduct(ip2_val_w_, value_data)+ip2_val_b_[0];
-        return std::pair<float, std::vector<float>>(value, policy);        
+        double value = Transforms::innerproduct(ip2_val_w_, value_data) + ip2_val_b_[0];
+        return std::pair<float, std::vector<float>>(value, policy_data);
       }
       
     private:
@@ -248,10 +238,15 @@ namespace lczero {
       
     };
       
-    
-    
-  } // namespace
-  
+    void OpenCLComputation::ComputeBlocking() {
+        for (auto& sample : planes_) {
+          float value; std::vector<float> policy;
+          std::tie(value, policy) = opencl_net_.ComputeBlocking(sample);
+          q_value_.emplace_back(value);
+          policy_data_.emplace_back(policy);
+        }
+      }
+
   REGISTER_NETWORK("opencl", OpenCLNetwork, 100)
   
   

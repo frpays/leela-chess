@@ -22,14 +22,13 @@
 #include <array>
 
 namespace lczero {
+
+    static constexpr auto WINOGRAD_ALPHA = 4;
+    static constexpr auto WINOGRAD_TILE = WINOGRAD_ALPHA * WINOGRAD_ALPHA;
   
   class Transforms {
     
   public:
-    
-    static constexpr auto WINOGRAD_ALPHA = 4;
-    static constexpr auto WINOGRAD_TILE = WINOGRAD_ALPHA * WINOGRAD_ALPHA;
-
     
     static std::vector<float> zeropad_U(const std::vector<float>& U,
                                         const int outputs, const int channels,
@@ -74,8 +73,8 @@ namespace lczero {
     
     static void batchnorm(size_t channels,
                    std::vector<float>& data,
-                   const float* means,
-                   const float* stddivs,
+                   const std::vector<float>& means,
+                   const std::vector<float>& stddivs,
                    const float* eltwise = nullptr);
     
     static void softmax(const std::vector<float>& input,
