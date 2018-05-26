@@ -22,14 +22,13 @@
 #include <array>
 
 namespace lczero {
+
+    static constexpr auto WINOGRAD_ALPHA = 4;
+    static constexpr auto WINOGRAD_TILE = WINOGRAD_ALPHA * WINOGRAD_ALPHA;
   
   class Transforms {
     
   public:
-    
-    static constexpr auto WINOGRAD_ALPHA = 4;
-    static constexpr auto WINOGRAD_TILE = WINOGRAD_ALPHA * WINOGRAD_ALPHA;
-
     
     static std::vector<float> zeropad_U(const std::vector<float>& U,
                                         const int outputs, const int channels,
@@ -60,33 +59,32 @@ namespace lczero {
                             std::vector<float>& M,
                             std::vector<float>& output);
     
-    template<unsigned int filter_size>
     static void convolve(size_t outputs,
                   const std::vector<float>& input,
                   const std::vector<float>& weights,
                   const std::vector<float>& biases,
                   std::vector<float>& output);
     
-    static void innerproduct(unsigned int inputs, unsigned int outputs,
-                      const std::vector<float>& input,
-                      const std::vector<float>& weights,
-                      const std::vector<float>& biases,
-                      std::vector<float>& output);
+    static void innerproduct(const std::vector<float>& input,
+                             const std::vector<float>& weights,
+                             const std::vector<float>& biases,
+                             std::vector<float>& output,
+                             bool apply_relu=false);
     
-    template <size_t spatial_size>
     static void batchnorm(size_t channels,
                    std::vector<float>& data,
-                   const float* means,
-                   const float* stddivs,
+                   const std::vector<float>& means,
+                   const std::vector<float>& stddivs,
                    const float* eltwise = nullptr);
-    
-    template <unsigned long filter_size>
-    static void im2col(const int channels, const std::vector<float>& input, std::vector<float>& output);
     
     static void softmax(const std::vector<float>& input,
                         std::vector<float>& output);
     
     static float innerproduct(const std::vector<float>& x, const std::vector<float>& y);
+
+    static void OffsetBatchNormMeans(std::vector<float>& bn_means, const std::vector<float>& biases);
+
+    static void InvertBatchNormStddev(std::vector<float>& weights);
 
 
   };

@@ -28,7 +28,6 @@
 #include <thread>
 
 #include "utils/exception.h"
-#include "utils/bititer.h"
 
 #include "CL/OpenCLUtils.h"
 
@@ -41,44 +40,14 @@
 
 namespace lczero {
   
-  namespace {
-    
-    
-    static constexpr int NUM_VALUE_INPUT_PLANES = 32;
-    static constexpr int NUM_POLICY_INPUT_PLANES = 32;
-    
-    static constexpr int NUM_OUTPUT_POLICY = 1858;
-    static constexpr int NUM_VALUE_CHANNELS = 128;
-    
-    
     class OpenCLNetwork;
-    
-    // Copy the vectors we need after weights is deallocated
-    struct OpenCLWeights {
-      
-      const std::vector<float> ip2_val_w;
-      const std::vector<float> ip2_val_b;
-      
-      OpenCLWeights(const Weights& weights):
-      ip2_val_w(weights.ip2_val_w),
-      ip2_val_b(weights.ip2_val_b)
-      {
-        
-      }
 
-    };
-    
-    
-    
     class OpenCLComputation : public NetworkComputation {
       
     public:
       
-      OpenCLComputation(const OpenCL_Network& opencl_net, const OpenCLWeights& weights):
+      OpenCLComputation(const OpenCLNetwork& opencl_net):
       opencl_net_(opencl_net),
-      weights_(weights),
-      input_data_(kInputPlanes*64),
-      value_data_(NUM_VALUE_CHANNELS),
       policy_data_(),
       q_value_(0) {
         
@@ -97,41 +66,8 @@ namespace lczero {
     public:
       
      // Do the computation.
-      void ComputeBlocking() override {
-        
-        for (auto& sample : planes_)
-          ComputeBlocking(sample);
+      void ComputeBlocking();
 
-      }
-      
-      
-      void ComputeBlocking(const InputPlanes &sample) {
-        
-        
-        int index=0;
-        for (const InputPlane& plane : sample) {
-          float value=plane.value;
-          const uint64_t one=1;
-          for (int i=0; i<64; i++)
-            input_data_[index++]=((plane.mask&(one<<i))==0 ) ? 0 : value;
-        }
-        
-        std::vector<float> policy_data(NUM_OUTPUT_POLICY);
-        opencl_net_.forward(input_data_, policy_data, value_data_);
-        
-        // Get the moves
-        softmax(policy_data, policy_data);
-        policy_data_.emplace_back(move(policy_data));
-        
-        // Now get the score
-        const std::vector<float>& ip2_val_w=weights_.ip2_val_w;
-        const std::vector<float>& ip2_val_b=weights_.ip2_val_b;
-        
-        double winrate=innerproduct(ip2_val_w, value_data_)+ip2_val_b[0];
-        q_value_.emplace_back(std::tanh(winrate));
-        
-      }
-      
       // Returns how many times AddInput() was called.
       int GetBatchSize() const override {
          return planes_.size();
@@ -149,69 +85,38 @@ namespace lczero {
       
       
     private:
-  
       
-      static void softmax(const std::vector<float>& input,
-                          std::vector<float>& output) {
-        
-        auto alpha = *std::max_element(begin(input),
-                                       begin(input) + input.size());
-        
-        auto denom = 0.0f;
-        for (auto i = size_t{0}; i < output.size(); i++) {
-          auto val   = std::exp(input[i] - alpha);
-          output[i]  = val;
-          denom     += val;
-        }
-        for (auto i = size_t{0}; i < output.size(); i++) {
-          output[i] = output[i] / denom;
-        }
-      }
-      
-      
-      static float innerproduct(const std::vector<float>& x, const std::vector<float>& y) {
-        // float cblas_sdot(const int __N, const float *__X, const int __incX, const float *__Y, const int __incY);
-        return cblas_sdot(x.size(), &x[0], 1, &y[0], 1);
-      }
-      
-
-      const OpenCL_Network& opencl_net_;
-      const OpenCLWeights& weights_;
+      const OpenCLNetwork& opencl_net_;
       
       std::vector<InputPlanes> planes_;
-      std::vector<float> input_data_;
-      std::vector<float> value_data_;
-      
       std::vector<std::vector<float>> policy_data_;
       std::vector<float> q_value_;
       
     };
-    
-    static constexpr auto WINOGRAD_ALPHA = 4;
     
     class OpenCLNetwork : public Network {
     public:
       
       virtual ~OpenCLNetwork(){};
 
-      OpenCLNetwork(const Weights& weights, const OptionsDict& options):
-      weights_(weights),
+      OpenCLNetwork(const Weights& w, const OptionsDict& options):
       params_(),
       opencl_(),
-      opencl_net_(opencl_)
+      opencl_net_(opencl_),
+      ip2_val_w_(w.ip2_val_w),
+      ip2_val_b_(w.ip2_val_b),
+      policy_data_size_(w.ip_pol_b.size()),
+      value_data_size_(w.ip1_val_b.size())
       {
-        
+        Weights weights = w; // temporary local copy, to be released when ctor complete
+
         params_.gpuId=options.GetOrDefault<int>("gpu", -1);
         params_.verbose=options.GetOrDefault<bool>("verbose", false);
         params_.force_tune=options.GetOrDefault<int>("force_tune", false);
         params_.tune_only=options.GetOrDefault<int>("tune_only", false);
         params_.tune_exhaustive=options.GetOrDefault<int>("tune_exhaustive", false);
-        
-        
-        const int inputChannels = kInputPlanes;
-        const int channels = weights.input.biases.size();
-        const size_t residual_blocks = weights.residual.size();
-        
+
+        const size_t channels = weights.input.biases.size();
         
         opencl_.initialize(channels, params_);
         
@@ -223,134 +128,125 @@ namespace lczero {
         
         
         size_t m_ceil = ceilMultiple(ceilMultiple(channels, mwg), vwm);
-        size_t k_ceil = ceilMultiple(ceilMultiple(inputChannels, kwg), vwm);
+        size_t k_ceil = ceilMultiple(ceilMultiple(kInputPlanes, kwg), vwm);
         
-        std::vector<float> input_conv_weights=Transforms::winograd_transform_f(weights.input.weights, channels, inputChannels);
-        
-        auto Upad = Transforms::zeropad_U(input_conv_weights,
-                              channels, inputChannels,
-                              m_ceil, k_ceil);
-        
-        std::vector<float> input_batchnorm_means=weights.input.bn_means; // copy ctor
-        OffsetBatchNormMeans(input_batchnorm_means, weights.input.biases);
-        
-        std::vector<float> input_batchnorm_stddivs=weights.input.bn_stddivs;
-        InvertBatchNormStddev(input_batchnorm_stddivs);
+        // first, process the input block
+        weights.input.weights = Transforms::winograd_transform_f(weights.input.weights, channels, kInputPlanes);
+        auto Upad = Transforms::zeropad_U(weights.input.weights,
+                                          channels, kInputPlanes,
+                                          m_ceil, k_ceil);
+        Transforms::OffsetBatchNormMeans(weights.input.bn_means, weights.input.biases);
+        Transforms::InvertBatchNormStddev(weights.input.bn_stddivs);
         
         // Winograd filter transformation changes filter size to 4x4
-        opencl_net_.push_input_convolution(WINOGRAD_ALPHA, inputChannels, channels,
-                                           Upad, input_batchnorm_means, input_batchnorm_stddivs);
+        opencl_net_.push_input_convolution(WINOGRAD_ALPHA, kInputPlanes, channels,
+                                           Upad, weights.input.bn_means, weights.input.bn_stddivs);
         
         // residual blocks
-        for (auto i = size_t{0}; i < residual_blocks; i++) {
+        for (auto& resblock : weights.residual) {
           
-          const Weights::Residual& residual=weights.residual[i];
-          const Weights::ConvBlock& conv1=residual.conv1;
-          const Weights::ConvBlock& conv2=residual.conv2;
+          auto& conv1 = resblock.conv1;
+          auto& conv2 = resblock.conv2;
           
-          std::vector<float> conv_weights_1=Transforms::winograd_transform_f(conv1.weights, channels, channels);
-          std::vector<float> conv_weights_2=Transforms::winograd_transform_f(conv2.weights, channels, channels);
+          conv1.weights = Transforms::winograd_transform_f(conv1.weights, channels, channels);
+          conv2.weights = Transforms::winograd_transform_f(conv2.weights, channels, channels);
           
-          auto Upad1 = Transforms::zeropad_U(conv_weights_1,
-                                 channels, channels,
-                                 m_ceil, m_ceil);
-          auto Upad2 = Transforms::zeropad_U(conv_weights_2,
-                                 channels, channels,
-                                 m_ceil, m_ceil);
+          auto Upad1 = Transforms::zeropad_U(conv1.weights,
+                                             channels, channels,
+                                             m_ceil, m_ceil);
+          auto Upad2 = Transforms::zeropad_U(conv2.weights,
+                                             channels, channels,
+                                             m_ceil, m_ceil);
           
-          
-          std::vector<float> batchnorm_means_1=conv1.bn_means; // copy ctor
-          OffsetBatchNormMeans(batchnorm_means_1, conv1.biases);
-          
-          std::vector<float> batchnorm_means_2=conv2.bn_means; // copy ctor
-          OffsetBatchNormMeans(batchnorm_means_2, conv2.biases);
-          
-          std::vector<float> batchnorm_stddivs_1=conv1.bn_stddivs; // copy ctor
-          InvertBatchNormStddev(batchnorm_stddivs_1);
-          
-          std::vector<float> batchnorm_stddivs_2=conv2.bn_stddivs; // copy ctor
-          InvertBatchNormStddev(batchnorm_stddivs_2);
+          Transforms::OffsetBatchNormMeans(conv1.bn_means, conv1.biases);
+          Transforms::OffsetBatchNormMeans(conv2.bn_means, conv2.biases);
+
+          Transforms::InvertBatchNormStddev(conv1.bn_stddivs);
+          Transforms::InvertBatchNormStddev(conv2.bn_stddivs);
           
           opencl_net_.push_residual(WINOGRAD_ALPHA, channels, channels,
-                                    Upad1,
-                                    batchnorm_means_1,
-                                    batchnorm_stddivs_1,
-                                    Upad2,
-                                    batchnorm_means_2,
-                                    batchnorm_stddivs_2);
+                                    Upad1, conv1.bn_means, conv1.bn_stddivs,
+                                    Upad2, conv2.bn_means, conv2.bn_stddivs);
         }
         
         constexpr unsigned int width = 8;
         constexpr unsigned int height = 8;
         
+        // policy head
+        const auto num_p_inputs  = weights.policy.bn_means.size(); // NUM_POLICY_INPUT_PLANES
+        Transforms::OffsetBatchNormMeans(weights.policy.bn_means, weights.policy.biases);
+        Transforms::InvertBatchNormStddev(weights.policy.bn_stddivs);
+
+        opencl_net_.push_policy(channels, num_p_inputs,
+                                num_p_inputs*width*height,
+                                weights.ip_pol_b.size(),
+                                weights.policy.weights,
+                                weights.policy.bn_means,
+                                weights.policy.bn_stddivs,
+                                weights.ip_pol_w, weights.ip_pol_b);
         
-        
-        std::vector<float> bn_pol_means=weights.policy.bn_means; // copy ctor
-        OffsetBatchNormMeans(bn_pol_means, weights.policy.biases);
-        
-        std::vector<float> bn_pol_stddivs=weights.policy.bn_stddivs;
-        InvertBatchNormStddev(bn_pol_stddivs);
-        
-        const std::vector<float>& conv_pol_w=weights.policy.weights;
-        const std::vector<float>& ip_pol_w_vec=weights.ip_pol_w;
-        const std::vector<float>& ip_pol_b_vec=weights.ip_pol_b;
-        
-        opencl_net_.push_policy(channels, NUM_POLICY_INPUT_PLANES,
-                                NUM_POLICY_INPUT_PLANES*width*height, NUM_OUTPUT_POLICY,
-                                conv_pol_w,
-                                bn_pol_means, bn_pol_stddivs,
-                                ip_pol_w_vec, ip_pol_b_vec);
-        
-        std::vector<float> bn_val_means=weights.value.bn_means;
-        OffsetBatchNormMeans(bn_val_means, weights.value.biases);
-        
-        std::vector<float> bn_val_stddivs=weights.value.bn_stddivs;
-        InvertBatchNormStddev(bn_val_stddivs);
-        
-        const std::vector<float>& conv_val_w=weights.value.weights;
-        const std::vector<float>& ip_val_w_vec=weights.ip1_val_w;
-        const std::vector<float>& ip_val_b_vec=weights.ip1_val_b;
-        
-        opencl_net_.push_value(channels, NUM_VALUE_INPUT_PLANES,
-                               NUM_VALUE_INPUT_PLANES*width*height, NUM_VALUE_CHANNELS,
-                               conv_val_w,
-                               bn_val_means, bn_val_stddivs,
-                               ip_val_w_vec, ip_val_b_vec);
-      }
-      
-      static void OffsetBatchNormMeans(std::vector<float>& bn_means, const std::vector<float>& biases) {
-        // Biases are not calculated and are typically zero but some networks might
-        // still have non-zero biases.
-        // Move biases to batchnorm means to make the output match without having
-        // to separately add the biases.
-        for (auto i=0; i<bn_means.size(); i++)
-          bn_means[i]-=biases[i];
-      }
-      
-      static void InvertBatchNormStddev(std::vector<float>& weights) {
-        constexpr float EPSILON=1e-5;
-        for(auto&& w : weights)
-          w = 1.0f / std::sqrt(w + EPSILON);
+
+        // value head
+        const auto num_v_inputs  = weights.value.bn_means.size();  // NUM_VALUE_INPUT_PLANES
+        Transforms::OffsetBatchNormMeans(weights.value.bn_means, weights.value.biases);
+        Transforms::InvertBatchNormStddev(weights.value.bn_stddivs);
+
+        opencl_net_.push_value(channels, num_v_inputs,
+                               num_v_inputs*width*height,
+                               weights.ip1_val_b.size(),
+                               weights.value.weights,
+                               weights.value.bn_means,
+                               weights.value.bn_stddivs,
+                               weights.ip1_val_w, weights.ip1_val_b);
       }
       
       std::unique_ptr<NetworkComputation> NewComputation() override {
-        return std::make_unique<OpenCLComputation>(opencl_net_, weights_);
+        return std::make_unique<OpenCLComputation>(*this);
       }
       
+      std::pair<float, std::vector<float>> ComputeBlocking(const InputPlanes &sample) const {
+        std::vector<float> input_data(kInputPlanes*64);
+        int index=0;
+        for (const InputPlane& plane : sample) {
+          float value=plane.value;
+          const uint64_t one=1;
+          for (int i=0; i<64; i++)
+            input_data[index++]=((plane.mask&(one<<i))==0 ) ? 0 : value;
+        }
+        
+        std::vector<float> policy_data(policy_data_size_);
+        std::vector<float> value_data(value_data_size_);
+
+        opencl_net_.forward(input_data, policy_data, value_data);
+        
+        // Get the moves
+        Transforms::softmax(policy_data, policy_data);
+        
+        // Now get the score
+        double value = Transforms::innerproduct(ip2_val_w_, value_data) + ip2_val_b_[0];
+        return std::pair<float, std::vector<float>>(value, policy_data);
+      }
       
     private:
-      
-      OpenCLWeights weights_;
+
       OpenCLParams params_;
       OpenCL opencl_;
       OpenCL_Network opencl_net_;
+      std::vector<float> ip2_val_w_;
+      std::vector<float> ip2_val_b_;
+      size_t policy_data_size_, value_data_size_;
       
     };
       
-    
-    
-  } // namespace
-  
+    void OpenCLComputation::ComputeBlocking() {
+        for (auto& sample : planes_) {
+          float value; std::vector<float> policy;
+          std::tie(value, policy) = opencl_net_.ComputeBlocking(sample);
+          q_value_.emplace_back(value);
+          policy_data_.emplace_back(policy);
+        }
+      }
+
   REGISTER_NETWORK("opencl", OpenCLNetwork, 100)
   
   

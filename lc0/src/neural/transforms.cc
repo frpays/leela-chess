@@ -51,7 +51,6 @@ namespace lczero
         }
       }
     }
-    
     return Upad;
   }
 
@@ -95,7 +94,6 @@ namespace lczero
         }
       }
     }
-    
     return U;
   }
   
@@ -286,24 +284,28 @@ namespace lczero
     winograd_transform_out(M, output, outputs);
   }
   
-  template<unsigned int filter_size>
   void Transforms::convolve(size_t outputs,
                             const std::vector<float>& input,
                             const std::vector<float>& weights,
                             const std::vector<float>& biases,
                             std::vector<float>& output) {
+    // lczero calls im2col<filter_size>, but only ever with filter_size=1,
+    // whose im2col specialization was overridden to be the simple memcpy
+    // commented below. I have no idea why the code was like that in the first place.
+    constexpr unsigned int filter_len = 1; // = filter_size * filter_size
     // fixed for 8x8
     constexpr unsigned int width = 8;
     constexpr unsigned int height = 8;
     constexpr unsigned int board_squares = width * height;
-    constexpr unsigned int filter_len = filter_size * filter_size;
     const auto input_channels = weights.size() / (biases.size() * filter_len);
     const auto filter_dim = filter_len * input_channels;
     assert(outputs * board_squares == output.size());
     
     std::vector<float> col(filter_dim * width * height);
-    im2col<filter_size>(input_channels, input, col);
-    
+    //im2col<filter_size>(input_channels, input, col);
+    // lczero only has filter_size, and filter_size=1 was specialized to merely this memcpy:
+    std::copy(begin(input), begin(input)+col.size(), begin(col));
+
     // Weight shape (output, input, filter_size, filter_size)
     // 96 22 3 3
     // outputs[96,8x8] = weights[96,22x3x3] x col[22x3x3,8x8]
@@ -331,46 +333,46 @@ namespace lczero
     }
   }
   
-  void Transforms::innerproduct(unsigned int inputs,unsigned int outputs,
-                                const std::vector<float>& input,
+  void Transforms::innerproduct(const std::vector<float>& inputs,
                                 const std::vector<float>& weights,
                                 const std::vector<float>& biases,
-                                std::vector<float>& output) {
+                                std::vector<float>& outputs,
+                                bool apply_relu) {
     
     cblas_sgemv(CblasRowMajor, CblasNoTrans,
                 // M     K
-                outputs, inputs,
-                1.0f, &weights[0], inputs,
-                &input[0], 1,
-                0.0f, &output[0], 1);
+                outputs.size(), inputs.size(),
+                1.0f, weights.data(), inputs.size(),
+                inputs.data(), 1, 0.0f,
+                outputs.data(), 1);
     
     auto lambda_ReLU = [](float val) { return (val > 0.0f) ?
       val : 0.0f; };
-    static constexpr int NUM_VALUE_CHANNELS = 128;
     
-    for (unsigned int o = 0; o < outputs; o++) {
-      float val = biases[o] + output[o];
-      if (outputs == NUM_VALUE_CHANNELS) { // OH THE HORROR
+    for (unsigned int o = 0; o < outputs.size(); o++) {
+      float val = biases[o] + outputs[o];
+      if (apply_relu) {
         val = lambda_ReLU(val);
       }
-      output[o] = val;
+      outputs[o] = val;
     }
   }
-  
-  template <size_t spatial_size>
+
   void Transforms::batchnorm(size_t channels,
                              std::vector<float>& data,
-                             const float* means,
-                             const float* stddivs,
+                             const std::vector<float>& means,
+                             const std::vector<float>& stddivs,
                              const float* eltwise)
   {
+    constexpr size_t spatial_size = 64; // either literal or width*height in forward_cpu
     auto lambda_ReLU = [](float val) { return (val > 0.0f) ?
       val : 0.0f; };
     
     for (auto c = size_t{0}; c < channels; ++c) {
       auto mean = means[c];
       auto scale_stddiv = stddivs[c];
-      
+
+      // TODO: why all the nonsense with pointers???
       if (eltwise == nullptr) {
         // Classical BN
         auto arr = &data[c * spatial_size];
@@ -388,48 +390,6 @@ namespace lczero
       }
     }
   }
-  
-  template <unsigned long filter_size>
-  void Transforms::im2col(const int channels, const std::vector<float>& input, std::vector<float>& output) {
-    constexpr unsigned int height = 8;
-    constexpr unsigned int width = 8;
-    constexpr unsigned int channel_size = height * width;
-    
-    constexpr int pad = (filter_size / 2);
-    constexpr unsigned int output_h = height + 2 * pad - filter_size  + 1;
-    constexpr unsigned int output_w = width + 2 * pad - filter_size + 1;
-    
-    const float* data_im = input.data();
-    float* data_col = output.data();
-    
-    for (int channel = channels; channel--; data_im += channel_size) {
-      for (unsigned int kernel_row = 0; kernel_row < filter_size; kernel_row++) {
-        for (unsigned int kernel_col = 0; kernel_col < filter_size; kernel_col++) {
-          int input_row = -pad + kernel_row;
-          for (int output_rows = output_h; output_rows; output_rows--) {
-            if ((unsigned)input_row < height) {
-              int input_col = -pad + kernel_col;
-              for (int output_col = output_w; output_col; output_col--) {
-                if ((unsigned)input_col < width) {
-                  *(data_col++) =
-                  data_im[input_row * width + input_col];
-                } else {
-                  *(data_col++) = 0;
-                }
-                input_col++;
-              }
-            } else {
-              for (int output_cols = output_w; output_cols; output_cols--) {
-                *(data_col++) = 0;
-              }
-            }
-            input_row++;
-          }
-        }
-      }
-    }
-  }
-
   
   float Transforms::innerproduct(const std::vector<float>& x, const std::vector<float>& y) {
     // float cblas_sdot(const int __N, const float *__X, const int __incX, const float *__Y, const int __incY);
@@ -453,36 +413,21 @@ namespace lczero
     }
   }
 
-  /* Template instantiations and specializations */
-  
-  
-  template <>
-  void Transforms::im2col<1>(const int channels,
-                             const std::vector<float>& input,
-                             std::vector<float>& output) {
-    constexpr unsigned int boardsize = 8;
-    auto outSize = size_t{channels * boardsize * boardsize};
-    assert(output.size() == outSize);
-    std::copy(begin(input), begin(input) + outSize, begin(output));
-  }
-  
-  
-  template void Transforms::batchnorm<64>(size_t channels,
-                                          std::vector<float>& data,
-                                          const float* means,
-                                          const float* stddivs,
-                                          const float* eltwise);
-  
-  
-  template
-  void Transforms::convolve<1>(size_t outputs,
-                               const std::vector<float>& input,
-                               const std::vector<float>& weights,
-                               const std::vector<float>& biases,
-                               std::vector<float>& output);
+  void Transforms::OffsetBatchNormMeans(std::vector<float>& bn_means, const std::vector<float>& biases) {
+        // Biases are not calculated and are typically zero but some networks might
+        // still have non-zero biases.
+        // Move biases to batchnorm means to make the output match without having
+        // to separately add the biases.
+        for (auto i=0; i<bn_means.size(); i++)
+          bn_means[i] -= biases[i];
+      }
+      
+  void Transforms::InvertBatchNormStddev(std::vector<float>& weights) {
+        constexpr float EPSILON = 1e-5;
+        for(auto& w : weights)
+          w = 1.0f / std::sqrt(w + EPSILON);
+      }
 
-
-  
-}
+} // namespace lczero
 
 
