@@ -66,11 +66,11 @@ namespace lczero {
                   const std::vector<float>& biases,
                   std::vector<float>& output);
     
-    static void innerproduct(unsigned int inputs, unsigned int outputs,
-                      const std::vector<float>& input,
-                      const std::vector<float>& weights,
-                      const std::vector<float>& biases,
-                      std::vector<float>& output);
+    static void innerproduct(const std::vector<float>& input,
+                             const std::vector<float>& weights,
+                             const std::vector<float>& biases,
+                             std::vector<float>& output,
+                             bool apply_relu=false);
     
     static void batchnorm(size_t channels,
                    std::vector<float>& data,
@@ -82,6 +82,10 @@ namespace lczero {
                         std::vector<float>& output);
     
     static float innerproduct(const std::vector<float>& x, const std::vector<float>& y);
+
+    static void OffsetBatchNormMeans(std::vector<float>& bn_means, const std::vector<float>& biases);
+
+    static void InvertBatchNormStddev(std::vector<float>& weights);
 
 
   };

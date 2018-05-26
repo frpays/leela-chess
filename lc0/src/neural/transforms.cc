@@ -334,11 +334,11 @@ namespace lczero
     }
   }
   
-  void Transforms::innerproduct(unsigned int inputs,unsigned int outputs,
-                                const std::vector<float>& input,
+  void Transforms::innerproduct(const std::vector<float>& input,
                                 const std::vector<float>& weights,
                                 const std::vector<float>& biases,
-                                std::vector<float>& output) {
+                                std::vector<float>& output,
+                                bool apply_relu) {
     
     cblas_sgemv(CblasRowMajor, CblasNoTrans,
                 // M     K
@@ -353,7 +353,7 @@ namespace lczero
     
     for (unsigned int o = 0; o < outputs; o++) {
       float val = biases[o] + output[o];
-      if (outputs == NUM_VALUE_CHANNELS) { // OH THE HORROR
+      if (apply_relu) { // OH THE HORROR
         val = lambda_ReLU(val);
       }
       output[o] = val;
@@ -414,6 +414,21 @@ namespace lczero
       output[i] = output[i] / denom;
     }
   }
+
+  static void Transforms::OffsetBatchNormMeans(std::vector<float>& bn_means, const std::vector<float>& biases) {
+        // Biases are not calculated and are typically zero but some networks might
+        // still have non-zero biases.
+        // Move biases to batchnorm means to make the output match without having
+        // to separately add the biases.
+        for (auto i=0; i<bn_means.size(); i++)
+          bn_means[i] -= biases[i];
+      }
+      
+  static void Transforms::InvertBatchNormStddev(std::vector<float>& weights) {
+        constexpr float EPSILON = 1e-5;
+        for(auto& w : weights)
+          w = 1.0f / std::sqrt(w + EPSILON);
+      }
 
 } // namespace lczero
 
